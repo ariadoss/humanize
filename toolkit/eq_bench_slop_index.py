@@ -15,7 +15,7 @@ Outputs JSON with:
     word_hits, bigram_hits, trigram_hits
     total_words
     legacy_slop_index    — only when --legacy is passed
-    flesch_kincaid_grade — capped at 14
+    flesch_kincaid_grade — raw grade (the complexity index uses it capped at 14)
     complexity_index     — 0-100 (FK + % polysyllabic average)
 
 Dependencies: stdlib only for slop scoring. NLTK and wordfreq only for the
@@ -25,11 +25,9 @@ from __future__ import annotations
 
 import functools
 import json
-import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable
 
 # Sibling imports resolve against this file's real directory, so they work when it
 # runs as a script, via runpy, as part of a package, or through a symlink; and they

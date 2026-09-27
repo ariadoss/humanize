@@ -24,8 +24,8 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mla_format import _CLOSE, code_lines, mask_literals, unmask_literals
-from textio import read_prose
+from mla_format import _CLOSE, code_lines, mask_literals, split_edges, unmask_literals
+from textio import read_prose, write_prose
 
 EM = re.compile(r"\s*[—–]\s*|\s*(?<!-)--(?!-)\s*")  # em, en, or double-hyphen, with surrounding space
 _nlp = None
@@ -155,29 +155,63 @@ def _list_gloss(line: str):
 
 
 # A dash ending a line whose sentence wraps onto the next prose line is not a
-# break-off: join the two so the clause after it decides the punctuation.
-_WRAPPED_DASH = re.compile(
-    r"(\S)[ \t]*(—|–|(?<!-)--(?!-))[ \t]*\n[ \t]*(?![-*+][ \t]|\d+[.)][ \t])(?=[^\s#>|`])")
+# break-off: join the two so the clause after it decides the punctuation. Never
+# across code (a CLI flag or SQL comment ends in `--`), and never out of a
+# heading, table row or quote, which do not wrap onto a plain line.
+_LINE_END_DASH = re.compile(r"(\S)[ \t]*(—|–|(?<!-)--(?!-))[ \t]*$")
+# \ue010 opens a masked literal: a line that starts with a comment, URL or link
+# definition is not a sentence continuation.
+_CONTINUATION = re.compile(r"[ \t]*(?![-*+][ \t]|\d+[.)][ \t])[^\s#>|`\ue010]")
+
+
+def _join_wrapped_dashes(text: str) -> str:
+    lines = text.split("\n")
+    code = code_lines(lines)
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        while (i + 1 < len(lines) and not code[i] and not code[i + 1]
+               and not line.lstrip().startswith(("#", "|", ">"))
+               and not line.endswith("  ")                       # a hard break ends the line
+               and not _SETEXT.match(lines[i + 1])
+               and _LINE_END_DASH.search(line) and _CONTINUATION.match(lines[i + 1])):
+            line = _LINE_END_DASH.sub(r"\1 \2 ", line) + lines[i + 1].lstrip()
+            i += 1
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+# A setext heading underline (`Heading` / `--`) is structure, not a dash.
+_SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+
+
+def _prose_lines(text: str):
+    """(line, is_editable) for each line: code, headings, quotes, tables, `*` lists and
+    setext underlines are structure and pass through untouched."""
+    src = text.split("\n")
+    for line, is_code in zip(src, code_lines(src)):
+        yield line, not (is_code or _SETEXT.match(line)
+                         or line.lstrip().startswith(("#", "*", ">", "|")))
 
 
 def fix_text(text: str) -> str:
     text, spans = mask_literals(text)
-    text = _WRAPPED_DASH.sub(r"\1 \2 ", text)
-    text = _protect_ranges(text)
-    src = text.split("\n")
+    text = _join_wrapped_dashes(text)
     lines = []
-    for line, is_code in zip(src, code_lines(src)):
-        if is_code or not EM.search(line) or line.lstrip().startswith(("#", "*", ">", "|")):
+    for line, editable in _prose_lines(text):
+        if not editable or not EM.search(line):
             lines.append(line)
             continue
-        gloss = _list_gloss(line)
-        if gloss is not None:
-            lines.append(gloss)
-            continue
-        # split into sentences, fix each, rejoin (keep it simple: split on sentence-final punct + space)
-        sents = re.split(r"(?<=[.!?])\s+", line)
-        lines.append(" ".join(fix_sentence(s) for s in sents))
-    return unmask_literals(_restore_ranges("\n".join(lines)), spans)
+        lead, body, hard = split_edges(line)
+        body = _protect_ranges(body)        # prose only: code keeps its `3--1`
+        gloss = _list_gloss(lead + body)
+        if gloss is None:
+            # split into sentences, fix each, rejoin (sentence-final punct + space)
+            sents = re.split(r"(?<=[.!?])\s+", body)
+            gloss = lead + " ".join(fix_sentence(s) for s in sents)
+        lines.append(_restore_ranges(gloss) + hard)
+    return unmask_literals("\n".join(lines), spans)
 
 
 # --tighten: KEEP the em-dash but close the spaces around it (word — word -> word—word), and
@@ -186,15 +220,14 @@ def fix_text(text: str) -> str:
 
 def tighten_text(text: str) -> str:
     text, spans = mask_literals(text)
-    text = _protect_ranges(text)
-    src = text.split("\n")
     lines = []
-    for line, is_code in zip(src, code_lines(src)):
-        if is_code or line.lstrip().startswith(("#", "*", ">", "|")) or ("—" not in line and "--" not in line):
+    for line, editable in _prose_lines(text):
+        if not editable or ("—" not in line and "--" not in line):
             lines.append(line)
             continue
-        lines.append(_CLOSE.sub("—", line))
-    return unmask_literals(_restore_ranges("\n".join(lines)), spans)
+        lead, body, hard = split_edges(line)
+        lines.append(lead + _restore_ranges(_CLOSE.sub("—", _protect_ranges(body))) + hard)
+    return unmask_literals("\n".join(lines), spans)
 
 
 def report_undecidable() -> None:
@@ -216,7 +249,7 @@ def main():
     text = read_prose(p)
     out = tighten_text(text) if "--tighten" in sys.argv else fix_text(text)
     if "--in-place" in sys.argv:
-        p.write_text(out)
+        write_prose(p, out)
         print(f"{'tightened' if '--tighten' in sys.argv else 'fixed'} em-dashes in {p}")
     else:
         sys.stdout.write(out)

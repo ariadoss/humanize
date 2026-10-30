@@ -26,17 +26,26 @@ import re
 import statistics
 import subprocess
 import sys
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# Sibling imports resolve against this file's real directory, so they work when it
-# runs as a script, via runpy, as part of a package, or through a symlink; and they
-# never write __pycache__ into the installed skill directory.
-sys.dont_write_bytecode = True
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-from eq_bench_slop_index import SLOP_BIGRAMS, SLOP_TRIGRAMS, SLOP_UNIGRAMS, load_slop_set
-from textio import read_prose
+# Sibling imports. Installed (or run with -m) the module sits in the
+# humanize_toolkit package and uses relative imports; importing it never touches
+# sys.path. Run by file path (the skill's scripts, hooks and evals) there is no
+# package, so the script's own directory is put on sys.path and the siblings are
+# imported bare, and no __pycache__ is written into the skill directory.
+if __package__:
+    from .eq_bench_slop_index import SLOP_BIGRAMS, SLOP_TRIGRAMS, SLOP_UNIGRAMS, load_slop_set, slop_index_new, slop_index_legacy
+    from .textio import read_prose
+    from .mla_format import code_lines, mask_literals
+else:
+    sys.dont_write_bytecode = True
+    if str(Path(__file__).resolve().parent) not in sys.path:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from eq_bench_slop_index import SLOP_BIGRAMS, SLOP_TRIGRAMS, SLOP_UNIGRAMS, load_slop_set, slop_index_new, slop_index_legacy
+    from textio import read_prose
+    from mla_format import code_lines, mask_literals
 
 HERE = Path(__file__).resolve().parent
 
@@ -131,6 +140,148 @@ def scan_lines(lines, patterns, flags=re.I):
     return hits
 
 
+# Narrow review signals, not a ban on imagining, questions, or fictional voice.
+# Require an opening position and setup punctuation; literal continuations such
+# as "Imagine two workers" and "Here's the thing I ordered" do not match.
+_RHETORICAL_START = r"(?:\A[ \t]*|(?<=\n)[ \t]*\n[ \t]*|(?<=[.!?])\s+|(?m:^[ \t]*(?:[-*+]|\d+[.)])[ \t]+))"
+_RHETORICAL_SETUP = re.compile(
+    _RHETORICAL_START + r"(?:\*\*|__)?(?P<setup>"
+    r"(?:imagine|picture)\s+(?:(?:this|the scene)(?:\s+for a (?:moment|second))?\s*[:.!?—]"
+    r"|(?:a|the)\s+world\s+(?:where|in which)\b)"
+    r"|(?:the|a)\s+(?:(?:practical|simple|real|key|big|important|ultimate)\s+)?"
+    r"(?:test|question)\s*:\s*(?:\*\*|__)?\s*"
+    r"(?=(?:can|could|should|would|do|does|did|is|are|will|what|why|how|when|where|who|whether|which)\b)"
+    r"|(?:the|a)\s+(?:(?:key|real|main|big)\s+)?(?:takeaway|lesson|point|bottom line)\s*[:?]"
+    r"|(?:here['’]s|here is)\s+the thing\s*[:.!?—]"
+    r"|(?:let['’]s|let us)\s+be honest\s*[:,.!?—]"
+    r"|let that sink in\s*[.!?](?=\s|$))", re.I)
+# Straight apostrophes in decades and common elisions are not speech openers.
+# An immediately closed word ('em') remains a quotation. Leading elisions in
+# single-quoted speech and malformed quotations still need editorial judgment.
+_ELISION = r"(?:[0-9]{2}s|em|tis|twas|cause|til|round|bout)\b(?!')"
+_QUOTE_RULES = [(re.compile(opener, re.I), re.compile(closer)) for opener, closer in [
+    (r'"', r'"'),
+    (r'“', r'”'),
+    (rf"(?<!\w)'(?!{_ELISION})", r"'(?!\w)"),
+    (r'‘', r"’(?!\w)"),
+]]
+_PARAGRAPH_QUOTE = re.compile(r'(?:\A|\n[ \t]*\n)[ \t]*(")(?=\S)')
+
+
+def _mask_quotations(text):
+    """Mask complete spans with bounded searches, including repeated openers."""
+    repeated = {match.start(1) for match in _PARAGRAPH_QUOTE.finditer(text)}
+    positions = []
+    for i, (opener, closer) in enumerate(_QUOTE_RULES):
+        opens = [match.start() for match in opener.finditer(text)]
+        closes = [match.start() for match in closer.finditer(text)
+                  if i != 0 or match.start() not in repeated]
+        positions.append((opens, closes))
+
+    def next_span(rule, cursor):
+        opens, closes = positions[rule]
+        opening = bisect_left(opens, cursor)
+        if opening == len(opens):
+            return None
+        start = opens[opening]
+        closing = bisect_right(closes, start)
+        return (start, closes[closing] + 1) if closing < len(closes) else None
+
+    matches = [next_span(i, 0) for i in range(len(positions))]
+    parts = []
+    cursor = 0
+    while any(match is not None for match in matches):
+        # Stable ties retain the original alternation's rule order. A quote
+        # opened before another quote style owns that entire enclosing span.
+        start, end = min((m for m in matches if m is not None), key=lambda m: m[0])
+        parts.extend([text[cursor:start], '\ufffc' + '\n' * text[start:end].count('\n')])
+        cursor = end
+        for i, pending in enumerate(matches):
+            if pending is not None and pending[0] < cursor:
+                matches[i] = next_span(i, cursor)
+    return ''.join(parts) + text[cursor:]
+
+
+_BLOCK_START = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|[-+*]\s|\d{1,9}[.)]\s|[`~]{3,}|(?:[-*_]\s*){3,}$|[=-]+[ \t]*$|\|)")
+
+# Selected shapes from blader/humanizer; provenance and MIT notice in NOTICE.md.
+# A match needs context: a real comparison, letter closing, or narrator's aside
+# may be worth keeping. Deliberately omit broad bans on "rather than", dates,
+# headings, triples, and individual words. Existing density checks cover rhythm.
+_EDITORIAL_OPENERS = re.compile(
+    _RHETORICAL_START + r"(?:\*\*|__)?(?P<setup>"
+    r"(?:let['’]s|let us)\s+(?:dive in|break this down)\s*[:.!?—]"
+    r"|(?:here['’]s|here is)\s+what you need\s+to know\s*[:.!?—]"
+    r"|without further ado\s*[:,.!—]|the thing is\s*[:,—]"
+    r"|real talk\s*[:,—]|honestly\s*\?"
+    r"|read that again\s*[.!](?=(?:\*\*|__)?(?:\s|$))"
+    r"|(?:that is|that['’]s)\s+(?:the real win|why it matters)\s*[.!](?=(?:\*\*|__)?(?:\s|$))"
+    r"|that distinction matters\s*[.!](?=(?:\*\*|__)?(?:\s|$))"
+    r"|(?:great question|certainly)\s*!"
+    r"|i hope this helps\s*[.!](?=(?:\*\*|__)?(?:\s|$))"
+    r"|(?:would you like me to|want me to)\b|should i continue\s*\?"
+    r"|as an ai\s+(?:language\s+)?model\b)", re.I)
+# Bound each side to a short clause and never cross a paragraph or intervening
+# sentence; otherwise an unrelated later "but" would manufacture a contrast.
+_CONTRAST_BOUNDARY = r"\n(?:[ \t]*\n|" + _BLOCK_START.pattern[1:] + r")"
+_CONTRAST_CLAUSE = rf"(?:(?!{_CONTRAST_BOUNDARY})[^.!?\ufffc|]){{1,120}}?"
+_CONTRAST_SPACE = rf"(?:(?!{_CONTRAST_BOUNDARY})\s)+"
+_EDITORIAL_CONTRAST = re.compile(
+    rf"\b(?P<setup>not{_CONTRAST_SPACE}{_CONTRAST_CLAUSE}\bbut{_CONTRAST_SPACE}"
+    rf"(?:also{_CONTRAST_SPACE})?"
+    rf"|(?:(?:this|it){_CONTRAST_SPACE}(?:is{_CONTRAST_SPACE}not|isn['’]t)"
+    rf"|it['’]s{_CONTRAST_SPACE}not){_CONTRAST_SPACE}{_CONTRAST_CLAUSE}"
+    r"[.;][ \t]*(?:\n[ \t]*)?"
+    rf"(?:it['’]s|(?:this|it){_CONTRAST_SPACE}is){_CONTRAST_SPACE})", re.I | re.M)
+
+
+def _review_hits(raw: str, patterns):
+    """Line-numbered review phrases outside Markdown literals and quotations.
+
+    Reuse the formatter's literal/code parsing; keep line breaks when masking
+    multiline literals so a finding still points at the original source.
+    Existing report groups and lexical scores intentionally remain unchanged.
+    """
+    original = raw.split('\n')
+    masked, held = mask_literals(raw)
+    # Keep a barrier where a protected span stood. Deleting it could connect
+    # unrelated clauses on either side and manufacture a contrast.
+    masked = re.sub("\ue010(\\d+)\ue011",
+                    lambda m: "\ufffc" + "\n" * held[int(m.group(1))].count("\n"), masked)
+    lines = masked.split('\n')
+    in_quote = False
+    for i, is_code in enumerate(code_lines(original)):
+        stripped = original[i].lstrip()
+        quoted_line = stripped.startswith('>')
+        if quoted_line:
+            # A bare > ends the quoted paragraph; an unmarked next line is not
+            # its lazy continuation. New Markdown blocks also end a paragraph.
+            in_quote = bool(stripped.lstrip('> ').strip())
+        elif not stripped or is_code or _BLOCK_START.match(original[i]):
+            in_quote = False
+        if is_code or quoted_line or in_quote:
+            lines[i] = ''
+    prose = '\n'.join(lines)
+    prose = _mask_quotations(prose)
+    hits = []
+    for pattern in patterns:
+        for match in pattern.finditer(prose):
+            line = prose.count('\n', 0, match.start('setup')) + 1
+            phrase = re.sub(r'\*\*|__', '', match.group('setup'))
+            hits.append((line, ' '.join(phrase.split()), original[line - 1].strip()))
+    return sorted(hits, key=lambda hit: hit[0])
+
+
+def rhetorical_scaffolding(raw: str):
+    """Stock scene invitations and announced questions; review before editing."""
+    return _review_hits(raw, [_RHETORICAL_SETUP])
+
+
+def editorial_patterns(raw: str):
+    """Stock transitions, contrast frames and chat wrappers, never auto-edits."""
+    return _review_hits(raw, [_EDITORIAL_OPENERS, _EDITORIAL_CONTRAST])
+
+
 _EXEMPT: set = set()  # set in main() from --exempt; tokens here are skipped from all checks
 
 
@@ -202,6 +353,13 @@ def main():
         r = subprocess.run([sys.executable, str(HERE / "eq_bench_slop_index.py"), str(path), "--legacy"],
                            capture_output=True, text=True, timeout=60)
         d = json.loads(r.stdout)
+        # Keep the standalone scorer's default metrics unchanged. In a reviewed
+        # report, the headline gate and the word findings must use the same
+        # exemptions. Keep tokens in place so phrase adjacency and denominators
+        # still describe the original prose.
+        if _EXEMPT:
+            d.update(slop_index_new(raw, exempt=_EXEMPT))
+            d['legacy_slop_index'] = slop_index_legacy(raw, exempt=_EXEMPT)
         print(f"slop_index = {d['slop_index']:.1f}  [word {d['word_hits']}, bigram {d['bigram_hits']}, trigram {d['trigram_hits']}]"
               f"   |   legacy_slop_index = {d.get('legacy_slop_index', float('nan')):.1f}  (phrase-probability formula)")
         print(f"complexity_index = {d.get('complexity_index', float('nan')):.1f}  (FK grade {d.get('flesch_kincaid_grade', float('nan')):.1f}; vocab-maxxing if high)")
@@ -227,6 +385,8 @@ def main():
     report_group("AI VERB-PHRASES (washed over, couldn't help but…)", scan_lines(lines, VERB_PHRASES))
     report_group("VAGUE GESTURES (something about, for a long moment…)", scan_lines(lines, VAGUE_GESTURES))
     report_group("AUTHORITY TROPES (the real question is, at its core…)", scan_lines(lines, [re.escape(p) for p in AUTHORITY_TROPES]))
+    report_group("RHETORICAL SCAFFOLDING (review, not authorship)", rhetorical_scaffolding(raw))
+    report_group("EDITORIAL PATTERNS (review context; never auto-delete)", editorial_patterns(raw))
     report_group("EXTENDED INTENSIFIERS (somehow, perfectly, merely…)", scan_lines(lines, [rf"\b{re.escape(w)}\b" for w in INTENSIFIERS]))
     report_group("BODY-AS-EMOTION-METER (heart pounding, breath caught…)", scan_lines(lines, BODY_METER))
     report_group("CLICHÉ SIMILES (like a knife/stone/sea…)", scan_lines(lines, CLICHE_SIMILE))
